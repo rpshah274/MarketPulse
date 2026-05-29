@@ -1,6 +1,7 @@
 import sys
 sys.path.append("D:/MarketPulse")
-
+from storage.stream_writer import RedisStreamWriter
+from processing.indicator_engine import IndicatorEngine
 from ingestion.models import Trade
 from websockets.asyncio.client import connect
 import json
@@ -41,25 +42,29 @@ class AlpacaClient:
         response = await self.connection.recv()
         print(response)
 
-    async def receive(self,writer):
+    async def receive(self,writer,engine):
         while True:
             message = await self.connection.recv()
             data = json.loads(message)
             for item in data:
                 if item['T'] == 't':  # trade message
-                    trade = Trade.from_raw(item)
-                    writer.write_trade(trade)
-                    print(f"Written: {trade.symbol} @ {trade.price}")
+                    if item['T'] == 't':
+                        trade = Trade.from_raw(item)
+                        writer.write_trade(trade)
+                        engine.process(trade)
+                        print(f"Written: {trade.symbol} @ {trade.price} | VWAP: {engine.vwap_calculators[trade.symbol].current_vwap:.2f}")
                 # elif item['T'] == 'b':  # bar message
                 #     pass
 
 async def main():
-    from storage.stream_writer import RedisStreamWriter
+    symbols = ["FAKEPACA"] #["AAPL", "TSLA"] 
     writer = RedisStreamWriter()
-    client = AlpacaClient(ALPACA_API_KEY, ALPACA_SECRET_KEY, ["FAKEPACA"])#["AAPL", "TSLA"])
+    engine = IndicatorEngine(symbols)
+
+    client = AlpacaClient(ALPACA_API_KEY, ALPACA_SECRET_KEY, symbols)
     await client.connect()
     await client.subscribe()
-    await client.receive(writer)
+    await client.receive(writer,engine)
 
 if __name__ == "__main__":
     import asyncio
