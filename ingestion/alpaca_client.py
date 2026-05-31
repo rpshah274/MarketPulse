@@ -1,11 +1,17 @@
 import sys
+import time
 sys.path.append("D:/MarketPulse")
+
+from storage.timeseries_writer import RedisTimeSeriesWriter 
 from storage.stream_writer import RedisStreamWriter
+from storage.db_writer import DBWriter
 from processing.indicator_engine import IndicatorEngine
 from ingestion.models import Trade
+from monitoring.metrics import trades_processed, processing_latency, websocket_connected
 from websockets.asyncio.client import connect
+from prometheus_client import start_http_server
 import json
-from config.settings import ALPACA_API_KEY, ALPACA_SECRET_KEY, WS_URL
+from config.settings import ALPACA_API_KEY, ALPACA_SECRET_KEY, WS_URL, SYMBOLS
 
 class AlpacaClient:
     def __init__(self, api_key: str, secret_key: str, symbols: list[str]):
@@ -16,6 +22,7 @@ class AlpacaClient:
 
     async def connect(self):
         self.connection = await connect(self.ws_url)
+        websocket_connected.set(1)
         # server sends a welcome message upon connection
         welcome = await self.connection.recv() 
         print(welcome)
@@ -42,29 +49,38 @@ class AlpacaClient:
         response = await self.connection.recv()
         print(response)
 
-    async def receive(self,writer,engine):
+    async def receive(self,writer,engine,db_writer,ts_writer):
         while True:
             message = await self.connection.recv()
             data = json.loads(message)
             for item in data:
                 if item['T'] == 't':  # trade message
-                    if item['T'] == 't':
-                        trade = Trade.from_raw(item)
-                        writer.write_trade(trade)
-                        engine.process(trade)
-                        print(f"Written: {trade.symbol} @ {trade.price} | VWAP: {engine.vwap_calculators[trade.symbol].current_vwap:.2f}")
-                # elif item['T'] == 'b':  # bar message
-                #     pass
+                    start = time.time()
+                    trade = Trade.from_raw(item)
+                    writer.write_trade(trade)
+                    engine.process(trade)
+                    db_writer.write_trade(trade)
+                    duration = time.time() - start
+                    trades_processed.labels(symbol=trade.symbol).inc()
+                    processing_latency.labels(symbol=trade.symbol).observe(duration)
+                    print(f"Written: {trade.symbol} @ {trade.price}")
+                elif item['T'] == 'b':  # bar message
+                    from ingestion.models import Bar
+                    bar = Bar.from_raw(item)
+                    ts_writer.write_bar(bar)
+                    print(f"Bar: {bar.symbol}  O:{bar.open} H:{bar.high} L:{bar.low} C:{bar.close} V:{bar.volume}")
 
 async def main():
-    symbols = ["FAKEPACA"] #["AAPL", "TSLA"] 
+    start_http_server(8001)
     writer = RedisStreamWriter()
-    engine = IndicatorEngine(symbols)
+    db_writer = DBWriter()
+    ts_writer = RedisTimeSeriesWriter()
+    engine = IndicatorEngine(SYMBOLS)
 
-    client = AlpacaClient(ALPACA_API_KEY, ALPACA_SECRET_KEY, symbols)
+    client = AlpacaClient(ALPACA_API_KEY, ALPACA_SECRET_KEY, SYMBOLS)
     await client.connect()
     await client.subscribe()
-    await client.receive(writer,engine)
+    await client.receive(writer,engine,db_writer,ts_writer)
 
 if __name__ == "__main__":
     import asyncio
